@@ -2,6 +2,8 @@
 name = "smb-kafka-watcher"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Publishes a Kafka event for every new file on an SMB share"
 
 [dependencies]
 anyhow = "1.0.104"
