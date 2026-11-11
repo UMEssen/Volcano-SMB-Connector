@@ -54,6 +54,7 @@ pub struct Stat {
 pub struct SmbConn {
     conn: Connection,
     tree: Tree,
+    list_delay: std::time::Duration,
     pub session_id: SessionId,
 }
 
@@ -95,6 +96,7 @@ impl SmbConn {
         Ok(Self {
             conn,
             tree,
+            list_delay: cfg.smb_list_delay,
             session_id: session.session_id,
         })
     }
@@ -126,7 +128,19 @@ impl SmbConn {
         let mut out = Vec::new();
         let root = paths::normalize(dir);
         let mut stack = vec![root.clone()];
+        let started = std::time::Instant::now();
+        let mut last_progress = started;
+        let mut dirs = 0u64;
         while let Some(d) = stack.pop() {
+            if dirs > 0 && !self.list_delay.is_zero() {
+                tokio::time::sleep(self.list_delay).await;
+            }
+            dirs += 1;
+            if last_progress.elapsed() >= std::time::Duration::from_secs(30) {
+                last_progress = std::time::Instant::now();
+                info!(root = %root, dirs, files = out.len(), queued = stack.len(),
+                      elapsed = ?started.elapsed(), current = %d, "scan in progress");
+            }
             let entries = match self.tree.list_directory(&mut self.conn, &d).await {
                 Ok(e) => e,
                 Err(e) if d != root && is_path_error(&e) => {

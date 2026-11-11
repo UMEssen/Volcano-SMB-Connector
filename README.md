@@ -83,6 +83,7 @@ Alle Werte per Umgebungsvariable. Optional zusätzlich eine TOML-Datei über `CO
 | `SMB_KRB_HOSTNAME` | Hostname für den SPN `cifs/<host>`, falls `SMB_SERVER` eine IP ist | Host aus `SMB_SERVER` |
 | `SMB_TIMEOUT_SECS` | TCP-Connect-Timeout | `10` |
 | `SMB_REQUIRE_ENCRYPTION` | Verbindung nur mit SMB3-Verschlüsselung | `false` |
+| `SMB_LIST_DELAY_MS` | Pause zwischen zwei Verzeichnis-Listings beim Abgleich (Last auf dem Fileserver begrenzen) | `0` |
 | `PATH_CASE_INSENSITIVE` | Keys kleinschreiben | `false` |
 | `KAFKA_BOOTSTRAP_SERVERS` | | Pflicht |
 | `KAFKA_TOPIC_PREFIX` | ergibt `<prefix>.events` und `<prefix>.state` | `smb-watcher` |

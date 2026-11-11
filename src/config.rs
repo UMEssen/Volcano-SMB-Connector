@@ -36,6 +36,8 @@ pub struct Config {
     pub smb_krb_hostname: Option<String>,
     pub smb_timeout: Duration,
     pub smb_require_encryption: bool,
+    /// Pause between directory listings during a scan (load limiting).
+    pub smb_list_delay: Duration,
     pub path_case_insensitive: bool,
 
     // Kafka
@@ -170,6 +172,7 @@ impl Config {
             smb_krb_hostname: get("SMB_KRB_HOSTNAME"),
             smb_timeout: secs("SMB_TIMEOUT_SECS", 10)?,
             smb_require_encryption: flag("SMB_REQUIRE_ENCRYPTION", false)?,
+            smb_list_delay: Duration::from_millis(int("SMB_LIST_DELAY_MS", 0)?.max(0) as u64),
             path_case_insensitive: flag("PATH_CASE_INSENSITIVE", false)?,
 
             kafka_bootstrap_servers: req("KAFKA_BOOTSTRAP_SERVERS")?,

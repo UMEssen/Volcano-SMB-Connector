@@ -84,21 +84,24 @@ pub async fn ensure_topics(cfg: &Config) -> Result<()> {
     }
 
     // The state topic must be compacted, otherwise retention eventually
-    // forgets known files and they would be reported again.
-    let opts = AdminOptions::new().request_timeout(Some(METADATA_TIMEOUT));
-    match admin
-        .describe_configs(&[ResourceSpecifier::Topic(&state)], &opts)
-        .await
-    {
-        Ok(results) => {
-            for r in results.into_iter().flatten() {
-                let policy = r.get("cleanup.policy").and_then(|e| e.value.clone());
-                if !policy.as_deref().unwrap_or("").contains("compact") {
-                    warn!(topic = %state, ?policy, "state topic is not compacted (cleanup.policy should be compact)");
+    // forgets known files and they would be reported again. Only checked for a
+    // pre-existing topic: a just-created one may not report its config yet.
+    if !missing.contains(&&state) {
+        let opts = AdminOptions::new().request_timeout(Some(METADATA_TIMEOUT));
+        match admin
+            .describe_configs(&[ResourceSpecifier::Topic(&state)], &opts)
+            .await
+        {
+            Ok(results) => {
+                for r in results.into_iter().flatten() {
+                    let policy = r.get("cleanup.policy").and_then(|e| e.value.clone());
+                    if !policy.as_deref().unwrap_or("").contains("compact") {
+                        warn!(topic = %state, ?policy, "state topic is not compacted (cleanup.policy should be compact)");
+                    }
                 }
             }
+            Err(e) => warn!(error = %e, "could not describe state topic config"),
         }
-        Err(e) => warn!(error = %e, "could not describe state topic config"),
     }
     Ok(())
 }
