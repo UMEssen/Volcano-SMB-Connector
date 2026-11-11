@@ -6,7 +6,8 @@
 #
 # Scenarios: baseline (no events for pre-existing files), new file, file being
 # written, service restart, Samba restart, many files at once (overflow path),
-# polling-only fallback (USE_WATCHER=false), scan resumed after a disconnect.
+# polling-only fallback (USE_WATCHER=false), scan resumed after a disconnect,
+# interrupted first baseline (partial state, no marker) finished without events.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -59,7 +60,7 @@ stop_watcher() {
 # return nothing.
 events() {
   "${COMPOSE[@]}" exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
-    --bootstrap-server kafka:9092 --topic smb-watcher.events --partition 0 --offset earliest \
+    --bootstrap-server kafka:9092 --topic "${TOPIC:-smb-watcher.events}" --partition 0 --offset earliest \
     --property print.key=true --timeout-ms 3000 2>/dev/null || true
 }
 count_key() { events | awk -F'\t' -v k="$1" '$1==k' | wc -l | tr -d ' '; }
@@ -166,6 +167,39 @@ r="$(since_mark | grep 'reconcile finished' | sed -n 1p)"
 echo "$r" | has 'interruptions=1' && ok "first reconcile completed with 1 interruption" || bad "unexpected: $r"
 dups="$(events | awk -F'\t' '{print $1}' | sort | uniq -d | wc -l | tr -d ' ')"
 [ "$dups" = 0 ] && ok "no duplicate events" || bad "$dups keys with duplicate events"
+
+say "9. interrupted first baseline: partial state without marker is finished silently"
+stop_watcher
+P=smb-watcher-b
+kt() { "${COMPOSE[@]}" exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 "$@" >/dev/null; }
+kt --create --topic "$P.events" --partitions 1 --replication-factor 1
+kt --create --topic "$P.state" --partitions 1 --replication-factor 1 --config cleanup.policy=compact
+# What a crash during the baseline write leaves behind: records for some
+# existing files, no completion marker.
+printf '%s\n' \
+  'root.txt|{"size":2,"mtime":"2026-01-01T00:00:00Z","first_seen":"2026-01-01T00:00:00Z"}' \
+  'in/sub/new.pdf|{"size":6,"mtime":"2026-01-01T00:00:00Z","first_seen":"2026-01-01T00:00:00Z"}' |
+  "${COMPOSE[@]}" exec -T kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 \
+    --topic "$P.state" --property parse.key=true --property key.separator='|' >/dev/null
+mark="$(wc -l < "$LOG")"
+start_watcher KAFKA_TOPIC_PREFIX="$P"
+end=$((SECONDS + 90))
+until since_mark | grep -c 'baseline complete, marker written' >/dev/null || [ $SECONDS -gt $end ]; do sleep 2; done
+since_mark | grep -c 'no baseline-complete marker' >/dev/null && ok "partial state detected" || bad "partial state not detected"
+since_mark | grep -c 'baseline complete, marker written' >/dev/null && ok "baseline finished, marker written" || bad "no marker written"
+sleep 5
+n="$(TOPIC="$P.events" events | wc -l | tr -d ' ')"
+[ "$n" = 0 ] && ok "no events for the files the interrupted baseline had not recorded" || bad "$n events after finishing the baseline (flood)"
+stop_watcher
+mark="$(wc -l < "$LOG")"
+start_watcher KAFKA_TOPIC_PREFIX="$P"
+sleep 5
+since_mark | grep 'state loaded' | grep -c 'baseline_complete=true' >/dev/null && ok "marker read back on restart" || bad "marker not read back"
+since_mark | grep -c -e 'baseline scan finished' -e 'no baseline-complete marker' >/dev/null && bad "baseline ran again" || ok "no second baseline"
+smb 'echo fresh > /shares/data/in/after-baseline.txt'
+end=$((SECONDS + 40)); n=0
+while [ $SECONDS -lt $end ]; do n="$(TOPIC="$P.events" count_key in/after-baseline.txt)"; [ "$n" -ge 1 ] && break; sleep 2; done
+[ "$n" = 1 ] && ok "new file after the baseline: one event" || bad "after-baseline.txt: $n events"
 
 say "result"
 if [ "$FAILS" = 0 ]; then echo "ALL PASSED"; else echo "$FAILS FAILED"; exit 1; fi

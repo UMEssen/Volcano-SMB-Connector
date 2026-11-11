@@ -16,7 +16,7 @@ use rdkafka::types::RDKafkaErrorCode;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::state::{FileEvent, FileState, StateMap};
+use crate::state::{BASELINE_MARKER_KEY, BaselineMarker, FileEvent, FileState, LoadedState};
 
 const METADATA_TIMEOUT: Duration = Duration::from_secs(15);
 const SEND_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -107,12 +107,12 @@ pub async fn ensure_topics(cfg: &Config) -> Result<()> {
 }
 
 /// Read the state topic from the beginning up to the current high watermark.
-pub async fn load_state(cfg: &Config) -> Result<StateMap> {
+pub async fn load_state(cfg: &Config) -> Result<LoadedState> {
     let cfg = cfg.clone();
     tokio::task::spawn_blocking(move || load_state_blocking(&cfg)).await?
 }
 
-fn load_state_blocking(cfg: &Config) -> Result<StateMap> {
+fn load_state_blocking(cfg: &Config) -> Result<LoadedState> {
     let topic = cfg.state_topic();
     let consumer: BaseConsumer = base_config(cfg)
         .set(
@@ -147,7 +147,7 @@ fn load_state_blocking(cfg: &Config) -> Result<StateMap> {
         }
     }
 
-    let mut state = StateMap::new();
+    let mut state = LoadedState::default();
     let mut records = 0u64;
     if remaining.is_empty() {
         info!(topic = %topic, "state topic is empty");
@@ -171,17 +171,8 @@ fn load_state_blocking(cfg: &Config) -> Result<StateMap> {
         let Some(key) = msg.key().map(|k| String::from_utf8_lossy(k).into_owned()) else {
             continue;
         };
-        match msg.payload() {
-            None => {
-                // Tombstone
-                state.remove(&key);
-            }
-            Some(p) => match serde_json::from_slice::<FileState>(p) {
-                Ok(fs) => {
-                    state.insert(key, fs);
-                }
-                Err(e) => warn!(%key, error = %e, "skipping unparsable state record"),
-            },
+        if let Err(e) = state.apply(&key, msg.payload()) {
+            warn!(%key, error = %e, "skipping unparsable state record");
         }
         let part = msg.partition();
         if remaining
@@ -191,7 +182,8 @@ fn load_state_blocking(cfg: &Config) -> Result<StateMap> {
             remaining.remove(&part);
         }
     }
-    info!(topic = %topic, records, files = state.len(), "state loaded");
+    info!(topic = %topic, records, files = state.files.len(),
+          baseline_complete = state.baseline_complete, "state loaded");
     Ok(state)
 }
 
@@ -234,6 +226,13 @@ impl Sink {
     pub async fn send_state(&self, key: &str, st: &FileState) -> Result<(), KafkaError> {
         let payload = serde_json::to_vec(st).expect("state serialises");
         self.send(&self.state_topic, key, &payload).await
+    }
+
+    /// Mark the baseline as complete (see [`BASELINE_MARKER_KEY`]).
+    pub async fn send_baseline_marker(&self, m: &BaselineMarker) -> Result<(), KafkaError> {
+        let payload = serde_json::to_vec(m).expect("marker serialises");
+        self.send(&self.state_topic, BASELINE_MARKER_KEY, &payload)
+            .await
     }
 
     pub fn flush(&self, timeout: Duration) {

@@ -17,6 +17,63 @@ pub struct FileState {
 
 pub type StateMap = HashMap<String, FileState>;
 
+/// Key of the record that marks the first (event-less) baseline as complete.
+///
+/// It starts with `/`, which a file key never does ([`crate::paths::key`]
+/// strips leading separators), so it cannot collide with a file.
+///
+/// Why a marker instead of "state is empty": the baseline writes one state
+/// record per existing file. If the process dies half-way through those
+/// writes, the state is no longer empty but incomplete, and treating every
+/// unrecorded old file as new would flood the events topic. Without the
+/// marker, the next start finishes the baseline (still without events).
+pub const BASELINE_MARKER_KEY: &str = "/baseline-complete";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaselineMarker {
+    #[serde(with = "rfc3339")]
+    pub completed_at: DateTime<Utc>,
+    /// Files recorded in the state when the baseline completed.
+    pub files: usize,
+}
+
+/// The state topic as loaded at startup.
+#[derive(Debug, Default)]
+pub struct LoadedState {
+    pub files: StateMap,
+    pub baseline_complete: bool,
+}
+
+impl LoadedState {
+    /// Apply one record of the state topic (in offset order).
+    /// `payload == None` is a tombstone. Returns an error text for a record
+    /// that cannot be parsed (it is skipped).
+    pub fn apply(&mut self, key: &str, payload: Option<&[u8]>) -> Result<(), String> {
+        if key == BASELINE_MARKER_KEY {
+            self.baseline_complete = payload.is_some();
+            return Ok(());
+        }
+        match payload {
+            None => {
+                self.files.remove(key);
+                Ok(())
+            }
+            Some(p) => match serde_json::from_slice::<FileState>(p) {
+                Ok(fs) => {
+                    self.files.insert(key.to_string(), fs);
+                    Ok(())
+                }
+                Err(e) => Err(e.to_string()),
+            },
+        }
+    }
+
+    /// Whether the first full scan must only record files, without events.
+    pub fn needs_baseline(&self, initial_scan_emits_events: bool) -> bool {
+        !self.baseline_complete && !initial_scan_emits_events
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
@@ -136,6 +193,73 @@ mod tests {
             size: 1,
             mtime: t(0),
         }
+    }
+
+    fn fs_json(size: u64) -> Vec<u8> {
+        serde_json::to_vec(&FileState {
+            size,
+            mtime: t(0),
+            first_seen: t(0),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn load_applies_records_tombstones_and_marker() {
+        let mut l = LoadedState::default();
+        l.apply("a", Some(&fs_json(1))).unwrap();
+        l.apply("b", Some(&fs_json(2))).unwrap();
+        l.apply("a", None).unwrap();
+        assert!(l.apply("c", Some(b"not json")).is_err());
+        assert_eq!(l.files.len(), 1);
+        assert_eq!(l.files["b"].size, 2);
+        assert!(!l.baseline_complete);
+
+        let marker = serde_json::to_vec(&BaselineMarker {
+            completed_at: t(0),
+            files: 1,
+        })
+        .unwrap();
+        l.apply(BASELINE_MARKER_KEY, Some(&marker)).unwrap();
+        assert!(l.baseline_complete);
+        assert!(
+            !l.files.contains_key(BASELINE_MARKER_KEY),
+            "marker is not a file"
+        );
+        // A tombstone on the marker withdraws it.
+        l.apply(BASELINE_MARKER_KEY, None).unwrap();
+        assert!(!l.baseline_complete);
+    }
+
+    #[test]
+    fn partial_baseline_without_marker_still_needs_baseline() {
+        // The crash case: some state records written, no marker.
+        let mut l = LoadedState::default();
+        l.apply("old/1.svs", Some(&fs_json(1))).unwrap();
+        assert!(
+            l.needs_baseline(false),
+            "must finish the baseline, not emit events"
+        );
+        assert!(
+            !l.needs_baseline(true),
+            "INITIAL_SCAN_EMITS_EVENTS=true never baselines"
+        );
+        l.baseline_complete = true;
+        assert!(!l.needs_baseline(false));
+        // Empty state on first start: baseline.
+        assert!(LoadedState::default().needs_baseline(false));
+    }
+
+    #[test]
+    fn marker_key_cannot_be_a_file_key() {
+        assert_ne!(
+            crate::paths::key(BASELINE_MARKER_KEY, false),
+            BASELINE_MARKER_KEY
+        );
+        assert_ne!(
+            crate::paths::key(BASELINE_MARKER_KEY, true),
+            BASELINE_MARKER_KEY
+        );
     }
 
     #[test]

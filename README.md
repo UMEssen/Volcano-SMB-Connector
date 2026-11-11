@@ -68,6 +68,13 @@ State-Topic `<prefix>.state` (compacted), gleicher Key, Value
 `{"size": u64, "mtime": "RFC3339", "first_seen": "RFC3339"}`. Ein Tombstone (Value `null`) entfernt einen Eintrag.
 Hinweis: ein Tombstone führt dazu, dass eine noch vorhandene Datei beim nächsten Abgleich erneut gemeldet wird.
 
+**Baseline-Marker:** Nach dem ersten Abgleich ohne Events (`INITIAL_SCAN_EMITS_EVENTS=false`) schreibt der Dienst als
+letzten Schritt den Eintrag `/baseline-complete` (Value `{"completed_at": …, "files": n}`) in das State-Topic; ein
+Datei-Key beginnt nie mit `/`. Fehlt der Marker beim Start, wird der Baseline-Abgleich (wieder ohne Events)
+abgeschlossen, auch wenn das State-Topic schon Einträge hat. So erzeugt ein Absturz mitten im Schreiben der Baseline
+keine Event-Flut für Bestandsdateien. Preis: Dateien, die genau in dieser Lücke neu hinzukommen, werden ohne Event
+erfasst. Consumer des State-Topics sollten diesen Key überspringen.
+
 **Pfad-Normalisierung:** relativ zum Share-Root (`SMB_BASE_PATH` ist Teil des Pfads), Trenner `/`, ohne führenden und
 abschließenden `/`. Mit `PATH_CASE_INSENSITIVE=true` wird der **Key** kleingeschrieben (Windows-Semantik); `path` im
 Event behält die Originalschreibweise.
@@ -104,7 +111,7 @@ Alle Werte per Umgebungsvariable. Optional zusätzlich eine TOML-Datei über `CO
 | `USE_WATCHER` | CHANGE_NOTIFY nutzen | `true` |
 | `WATCHER_MAX_FAILURES` | Fehlschläge in Folge bis zum Polling-Fallback | `5` |
 | `IGNORE_PATTERNS` | kommagetrennte Globs (Dateiname, case-insensitiv; mit `/` gegen den ganzen Pfad) | `*.tmp,~$*,.~lock*,Thumbs.db,desktop.ini` |
-| `INITIAL_SCAN_EMITS_EVENTS` | bei leerem State vorhandene Dateien melden (sonst nur State füllen) | `false` |
+| `INITIAL_SCAN_EMITS_EVENTS` | ohne Baseline-Marker vorhandene Dateien melden (sonst nur State füllen, siehe Baseline-Marker) | `false` |
 | `LOG_FORMAT` | `pretty` oder `json` | `pretty` (Image: `json`) |
 | `RUST_LOG` | Log-Filter | `info,smb2=warn,rdkafka=info` |
 | `HTTP_PORT` | Port für `/healthz`, `/readyz`, `/metrics` | `8080` |
@@ -162,7 +169,7 @@ Szenarien des Integrationstests: Baseline (keine Events für vorhandene Dateien)
 im Schreibvorgang (genau ein Event mit Endgröße), Ignore-Patterns, Neustart des Dienstes (Datei während Downtime → via
 Abgleich, keine Duplikate), Neustart von Samba (Reconnect), 3000 Dateien auf einmal, Polling-Fallback
 (`USE_WATCHER=false`), Samba-Neustart mitten im Abgleich (Listing wird fortgesetzt, alle Dateien gemeldet, keine
-Duplikate). Die Ports binden nur an `127.0.0.1` (Samba 14450, Kafka 19092, HTTP 18080).
+Duplikate), unterbrochene Baseline (State ohne Marker: wird ohne Events abgeschlossen, danach normaler Betrieb). Die Ports binden nur an `127.0.0.1` (Samba 14450, Kafka 19092, HTTP 18080).
 
 Hinweis zum Overflow-Pfad: Samba lieferte im Test auch bei 3000 Dateien alle Notifications ohne
 `STATUS_NOTIFY_ENUM_DIR`; der Overflow-Zweig (Abgleich 2 s nach dem Overflow) ist daher nur durch Code-Review, nicht

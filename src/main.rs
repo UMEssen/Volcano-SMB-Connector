@@ -100,7 +100,11 @@ async fn main() -> Result<()> {
     };
     let sink = kafka::Sink::new(&cfg)?;
     ready.store(true, Ordering::Relaxed);
-    info!(files = state.len(), "ready");
+    info!(
+        files = state.files.len(),
+        baseline_complete = state.baseline_complete,
+        "ready"
+    );
 
     App::new(cfg, sink, state, metrics)?
         .run(cancel.clone())

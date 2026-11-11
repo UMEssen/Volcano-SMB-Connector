@@ -22,7 +22,9 @@ use crate::paths;
 use crate::scan::Scan;
 use crate::smb::{self, Hint, SmbConn};
 use crate::stability::{Observation, Pending, Verdict};
-use crate::state::{self, FileEvent, FileState, ListedFile, Source, StateMap};
+use crate::state::{
+    self, BaselineMarker, FileEvent, FileState, ListedFile, LoadedState, Source, StateMap,
+};
 
 /// Concurrent in-flight files during emit / baseline writes.
 const EMIT_CONCURRENCY: usize = 64;
@@ -100,8 +102,9 @@ pub struct App {
     /// State writes whose event is already acknowledged but whose state
     /// record failed; retried on every stability tick.
     unsaved_state: HashMap<String, FileState>,
-    /// First start with an empty state and `INITIAL_SCAN_EMITS_EVENTS=false`:
-    /// the first complete reconciliation only fills the state.
+    /// No baseline-complete marker in the state and
+    /// `INITIAL_SCAN_EMITS_EVENTS=false`: the next complete reconciliation only
+    /// records files (no events), then writes the marker.
     baseline_only: bool,
     watcher_failures: u32,
     watcher_disabled: bool,
@@ -114,13 +117,20 @@ impl App {
     pub fn new(
         cfg: Config,
         sink: Sink,
-        state: StateMap,
+        loaded: LoadedState,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
         let ignore = IgnoreSet::new(&cfg.ignore_patterns)?;
-        let baseline_only = state.is_empty() && !cfg.initial_scan_emits_events;
-        if baseline_only {
+        let baseline_only = loaded.needs_baseline(cfg.initial_scan_emits_events);
+        let state = loaded.files;
+        if baseline_only && state.is_empty() {
             info!("state is empty: first scan records existing files without emitting events");
+        } else if baseline_only {
+            warn!(
+                files = state.len(),
+                "state has no baseline-complete marker (an earlier baseline was interrupted): \
+                 finishing it without emitting events"
+            );
         }
         metrics.state_files.set(state.len() as i64);
         Ok(Self {
@@ -476,7 +486,21 @@ impl App {
         }
         self.metrics.state_files.set(self.state.len() as i64);
         if failed == 0 {
-            self.baseline_only = false;
+            // Last step, only after every file record is acknowledged.
+            let marker = BaselineMarker {
+                completed_at: Utc::now(),
+                files: self.state.len(),
+            };
+            match self.sink.send_baseline_marker(&marker).await {
+                Ok(()) => {
+                    info!(files = marker.files, "baseline complete, marker written");
+                    self.baseline_only = false;
+                }
+                Err(e) => {
+                    self.metrics.kafka_errors.inc();
+                    error!(error = %e, "baseline: writing the completion marker failed, retrying at next reconcile");
+                }
+            }
         } else {
             error!(
                 failed,
