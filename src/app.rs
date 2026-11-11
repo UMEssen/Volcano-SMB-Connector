@@ -19,6 +19,7 @@ use crate::health::Metrics;
 use crate::ignore::IgnoreSet;
 use crate::kafka::Sink;
 use crate::paths;
+use crate::scan::Scan;
 use crate::smb::{self, Hint, SmbConn};
 use crate::stability::{Observation, Pending, Verdict};
 use crate::state::{self, FileEvent, FileState, ListedFile, Source, StateMap};
@@ -105,6 +106,8 @@ pub struct App {
     watcher_failures: u32,
     watcher_disabled: bool,
     last_session: Option<SessionId>,
+    /// A full scan interrupted by a disconnect, resumed by the next reconcile.
+    scan: Option<Scan>,
 }
 
 impl App {
@@ -132,6 +135,7 @@ impl App {
             baseline_only,
             watcher_failures: 0,
             last_session: None,
+            scan: None,
         })
     }
 
@@ -343,17 +347,41 @@ impl App {
         conn: &mut SmbConn,
         cancel: &CancellationToken,
     ) -> Result<(), Exit> {
-        let started = Instant::now();
+        let mut scan = match self.scan.take() {
+            Some(mut s) => {
+                s.interruptions += 1;
+                self.metrics.scan_resumes.inc();
+                info!(dirs = s.dirs_done(), files = s.files_found(), queued = s.queued(),
+                      age = ?s.age(), interruptions = s.interruptions,
+                      "resuming interrupted scan");
+                s
+            }
+            None => Scan::new(&self.cfg.smb_base_path),
+        };
         // A large tree can take minutes; don't hold up SIGTERM for it.
-        let walk = conn.walk(
-            &self.cfg.smb_base_path,
-            &self.ignore,
-            self.cfg.path_case_insensitive,
-        );
-        let listing = run_cancellable(cancel, walk)
-            .await
-            .ok_or(Exit::Shutdown)??;
-        let took = started.elapsed();
+        let res = run_cancellable(
+            cancel,
+            conn.scan(&mut scan, &self.ignore, self.cfg.path_case_insensitive),
+        )
+        .await;
+        match res {
+            None => return Err(Exit::Shutdown),
+            Some(Err(e)) => {
+                // Keep the progress; the reconcile after the reconnect resumes it.
+                warn!(
+                    dirs = scan.dirs_done(),
+                    files = scan.files_found(),
+                    queued = scan.queued(),
+                    "scan interrupted, will resume after reconnect"
+                );
+                self.scan = Some(scan);
+                return Err(e.into());
+            }
+            Some(Ok(())) => {}
+        }
+        let took = scan.age();
+        let interruptions = scan.interruptions;
+        let listing = scan.into_files();
         self.metrics.reconcile_duration.observe(took.as_secs_f64());
 
         if self.baseline_only {
@@ -362,6 +390,7 @@ impl App {
                 files = listing.len(),
                 state = self.state.len(),
                 ?took,
+                interruptions,
                 "baseline scan finished"
             );
             return Ok(());
@@ -397,6 +426,7 @@ impl App {
             new,
             pending = self.pending.len(),
             ?took,
+            interruptions,
             "reconcile finished"
         );
         self.emit(ready, cancel).await;

@@ -6,6 +6,7 @@ mod health;
 mod ignore;
 mod kafka;
 mod paths;
+mod scan;
 mod smb;
 mod stability;
 mod state;

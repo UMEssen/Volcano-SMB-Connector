@@ -6,7 +6,7 @@
 #
 # Scenarios: baseline (no events for pre-existing files), new file, file being
 # written, service restart, Samba restart, many files at once (overflow path),
-# polling-only fallback (USE_WATCHER=false).
+# polling-only fallback (USE_WATCHER=false), scan resumed after a disconnect.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -32,6 +32,9 @@ say()  { printf '\n=== %s\n' "$*"; }
 ok()   { printf '  ok   %s\n' "$*"; }
 bad()  { printf '  FAIL %s\n' "$*"; FAILS=$((FAILS+1)); }
 smb()  { "${COMPOSE[@]}" exec -T samba sh -c "$1"; }
+# Like `grep -q`, but reads all input: with pipefail, `grep -q` exiting early
+# makes the writer die of SIGPIPE and the pipeline count as failed.
+has()  { grep -c -- "$1" >/dev/null; }
 
 # start_watcher [VAR=value ...]: extra env overrides the defaults
 start_watcher() {
@@ -93,13 +96,13 @@ n="$(events | wc -l | tr -d ' ')"
 say "2. new file"
 smb 'mkdir -p /shares/data/in/sub && echo hello > /shares/data/in/sub/new.pdf'
 wait_for_key in/sub/new.pdf 30 && expect_once in/sub/new.pdf || bad "no event for in/sub/new.pdf"
-events | grep -q '"source":"watcher"' && ok "detected via watcher" || bad "event not from watcher"
+events | has '"source":"watcher"' && ok "detected via watcher" || bad "event not from watcher"
 smb 'echo tmp > /shares/data/in/ignored.tmp; echo tmp > /shares/data/in/~\$lock.docx'
 
 say "3. large file being written (must emit once, with final size)"
 smb 'for i in 1 2 3 4 5 6 7 8; do dd if=/dev/zero bs=1M count=4 2>/dev/null >> /shares/data/in/big.bin; sleep 1; done'
 wait_for_key in/big.bin 30 && expect_once in/big.bin || bad "no event for in/big.bin"
-events | grep -q '"path":"in/big.bin","size":33554432' && ok "big.bin size 32 MiB" || bad "big.bin event has wrong size: $(events | grep big.bin)"
+events | has '"path":"in/big.bin","size":33554432' && ok "big.bin size 32 MiB" || bad "big.bin event has wrong size: $(events | grep big.bin)"
 n="$(events | grep -c -e 'ignored.tmp' -e 'lock.docx' || true)"
 [ "$n" = 0 ] && ok "ignore patterns honoured" || bad "$n events for ignored files"
 
@@ -109,7 +112,7 @@ grep -q 'flushing Kafka producer' "$LOG" && ok "graceful shutdown" || bad "no gr
 smb 'echo during-downtime > /shares/data/in/while-down.txt'
 start_watcher
 wait_for_key in/while-down.txt 30 && expect_once in/while-down.txt || bad "no event for in/while-down.txt"
-events | grep 'while-down' | grep -q '"source":"reconcile"' && ok "detected via reconcile" || bad "while-down not from reconcile"
+events | grep 'while-down' | has '"source":"reconcile"' && ok "detected via reconcile" || bad "while-down not from reconcile"
 expect_once in/sub/new.pdf  # no re-emit after restart
 
 say "5. Samba restart"
@@ -137,9 +140,32 @@ stop_watcher
 start_watcher USE_WATCHER=false POLL_INTERVAL_SECS=5
 smb 'echo polled > /shares/data/in/polled.txt'
 wait_for_key in/polled.txt 40 && expect_once in/polled.txt || bad "no event in polling mode"
-events | grep 'polled.txt' | grep -q '"source":"reconcile"' && ok "detected via polling reconcile" || bad "polled.txt not from reconcile"
+events | grep 'polled.txt' | has '"source":"reconcile"' && ok "detected via polling reconcile" || bad "polled.txt not from reconcile"
 w="$(curl -s "localhost:$HTTP_PORT/metrics" | awk '/^smb_watcher_watcher_active/{print $2}')"
 [ "$w" = 0 ] && ok "watcher_active=0" || bad "watcher_active=$w"
+
+say "8. full scan interrupted by a Samba restart resumes instead of restarting"
+stop_watcher
+smb 'mkdir -p /shares/data/deep && cd /shares/data/deep && i=0; while [ $i -lt 1500 ]; do mkdir d$i && echo $i > d$i/f.dat; i=$((i+1)); done'
+mark="$(wc -l < "$LOG")"
+since_mark() { tail -n +"$((mark + 1))" "$LOG"; }
+# ~1500 directories at 20 ms each: the initial scan takes > 30 s.
+start_watcher USE_WATCHER=false POLL_INTERVAL_SECS=600 SMB_LIST_DELAY_MS=20
+sleep 10
+"${COMPOSE[@]}" restart samba >/dev/null
+end=$((SECONDS + 150)); got=0
+while [ $SECONDS -lt $end ]; do
+  got="$(events | awk -F'\t' '$1 ~ /^deep\//' | sort -u | wc -l | tr -d ' ')"
+  [ "$got" -ge 1500 ] && break
+  sleep 5
+done
+[ "$got" -ge 1500 ] && ok "$got/1500 files in the interrupted tree reported" || bad "only $got/1500 deep files reported"
+since_mark | grep -c 'scan interrupted, will resume' >/dev/null && ok "scan interrupted mid-way" || bad "scan was not interrupted (restart too late?)"
+since_mark | grep -c 'resuming interrupted scan' >/dev/null && ok "scan resumed" || bad "scan not resumed"
+r="$(since_mark | grep 'reconcile finished' | sed -n 1p)"
+echo "$r" | has 'interruptions=1' && ok "first reconcile completed with 1 interruption" || bad "unexpected: $r"
+dups="$(events | awk -F'\t' '{print $1}' | sort | uniq -d | wc -l | tr -d ' ')"
+[ "$dups" = 0 ] && ok "no duplicate events" || bad "$dups keys with duplicate events"
 
 say "result"
 if [ "$FAILS" = 0 ]; then echo "ALL PASSED"; else echo "$FAILS FAILED"; exit 1; fi

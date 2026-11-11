@@ -3,7 +3,8 @@
 //! The low-level API (`Connection` + `Session` + `Tree`) is used for both NTLM
 //! and Kerberos because `SmbClient::connect` only does NTLM. Reconnects are
 //! handled by the caller: on a connection-level error the whole `SmbConn` is
-//! dropped and rebuilt, followed by a full reconciliation.
+//! dropped and rebuilt, followed by a full reconciliation that resumes an
+//! interrupted scan (see [`crate::scan`]).
 
 use chrono::{DateTime, Utc};
 use smb2::auth::kerberos::ccache::load_ccache;
@@ -18,6 +19,7 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, SmbAuth};
 use crate::ignore::IgnoreSet;
 use crate::paths;
+use crate::scan::{Entry, Scan};
 use crate::state::ListedFile;
 
 pub type SmbResult<T> = Result<T, smb2::Error>;
@@ -114,59 +116,46 @@ impl SmbConn {
         }
     }
 
-    /// Recursively list regular files below `dir` (share-relative).
+    /// Continue `scan` until it is complete or the connection fails.
     ///
-    /// Links (junctions, symlinks) are not followed. Ignored names are dropped.
-    /// A sub-directory that vanishes or is unreadable is skipped with a
-    /// warning; an error on `dir` itself or on the connection is returned.
+    /// Links (junctions, symlinks) are not followed and ignored names are
+    /// dropped. On error the scan keeps its progress and can be resumed on a
+    /// new connection.
+    pub async fn scan(
+        &mut self,
+        scan: &mut Scan,
+        ignore: &IgnoreSet,
+        case_insensitive: bool,
+    ) -> SmbResult<()> {
+        let (tree, conn) = (&self.tree, &mut self.conn);
+        let list = async |d: &str| -> SmbResult<Vec<Entry>> {
+            let entries = tree.list_directory(conn, d).await?;
+            Ok(entries
+                .into_iter()
+                .map(|e| Entry {
+                    is_link: e.is_link(),
+                    name: e.name,
+                    is_directory: e.is_directory,
+                    size: e.size,
+                    mtime: filetime_utc(e.modified),
+                })
+                .collect())
+        };
+        scan.run(list, ignore, case_insensitive, self.list_delay)
+            .await
+    }
+
+    /// One-shot recursive listing of `dir` (used for directories reported by
+    /// the watcher).
     pub async fn walk(
         &mut self,
         dir: &str,
         ignore: &IgnoreSet,
         case_insensitive: bool,
     ) -> SmbResult<Vec<ListedFile>> {
-        let mut out = Vec::new();
-        let root = paths::normalize(dir);
-        let mut stack = vec![root.clone()];
-        let started = std::time::Instant::now();
-        let mut last_progress = started;
-        let mut dirs = 0u64;
-        while let Some(d) = stack.pop() {
-            if dirs > 0 && !self.list_delay.is_zero() {
-                tokio::time::sleep(self.list_delay).await;
-            }
-            dirs += 1;
-            if last_progress.elapsed() >= std::time::Duration::from_secs(30) {
-                last_progress = std::time::Instant::now();
-                info!(root = %root, dirs, files = out.len(), queued = stack.len(),
-                      elapsed = ?started.elapsed(), current = %d, "scan in progress");
-            }
-            let entries = match self.tree.list_directory(&mut self.conn, &d).await {
-                Ok(e) => e,
-                Err(e) if d != root && is_path_error(&e) => {
-                    warn!(dir = %d, error = %e, "skipping unreadable directory");
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            for e in entries {
-                if e.name == "." || e.name == ".." || e.is_link() {
-                    continue;
-                }
-                let path = paths::join(&d, &e.name);
-                if e.is_directory {
-                    stack.push(path);
-                } else if !ignore.is_ignored(&path) {
-                    out.push(ListedFile {
-                        key: paths::key(&path, case_insensitive),
-                        smb_path: path,
-                        size: e.size,
-                        mtime: filetime_utc(e.modified),
-                    });
-                }
-            }
-        }
-        Ok(out)
+        let mut s = Scan::new(dir);
+        self.scan(&mut s, ignore, case_insensitive).await?;
+        Ok(s.into_files())
     }
 
     pub async fn watch(&mut self, dir: &str) -> SmbResult<Watcher> {

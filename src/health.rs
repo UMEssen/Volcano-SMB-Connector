@@ -24,6 +24,7 @@ pub struct Metrics {
     pub watcher_overflows: IntCounter,
     pub watcher_active: IntGauge,
     pub smb_reconnects: IntCounter,
+    pub scan_resumes: IntCounter,
 }
 
 impl Metrics {
@@ -63,6 +64,10 @@ impl Metrics {
             watcher_overflows: c("watcher_overflows_total", "CHANGE_NOTIFY overflows")?,
             watcher_active: g("watcher_active", "1 if CHANGE_NOTIFY is in use")?,
             smb_reconnects: c("smb_reconnects_total", "SMB (re)connects after an error")?,
+            scan_resumes: c(
+                "scan_resumes_total",
+                "Full scans resumed after an interruption",
+            )?,
             registry: r,
         })
     }

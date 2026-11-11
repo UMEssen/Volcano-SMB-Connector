@@ -29,6 +29,13 @@ Kleiner Rust-Dienst, der ein SMB2/3-Share überwacht und für jede **neu hinzuge
 Junctions und Symlinks werden beim Listing nicht verfolgt. Taucht per Watcher ein neues Verzeichnis auf (z. B. ein
 hineinkopierter Ordner), wird es sofort rekursiv gelistet.
 
+**Fortsetzbarer Abgleich:** Bricht die Verbindung während eines vollständigen Listings ab, behält der Dienst die
+bereits gefundenen Dateien und die noch offenen Verzeichnisse und setzt das Listing nach dem Reconnect an derselben
+Stelle fort, statt von vorn zu beginnen. Ein Verzeichnis verlässt die Warteschlange erst, wenn sein Listing
+erfolgreich war. Wichtig für große Shares, deren Server Verbindungen nach einigen Minuten Last trennt: der erste
+Abgleich wird sonst nie fertig. Einträge aus der Zeit vor der Unterbrechung können veraltet sein; das fängt die
+Stabilitätsprüfung ab (gelöschte Kandidaten fallen beim erneuten `stat` heraus).
+
 ## Zustellsemantik: at-least-once
 
 - Producer mit `enable.idempotence=true` und `acks=all`.
@@ -121,12 +128,12 @@ KAFKA_PROP_SSL_CA_LOCATION=/etc/kafka-ca/ca.crt
 
 - **SIGTERM/SIGINT:** Watcher schließen, Tree trennen, Producer flushen (max. 10 s).
 - **Fehler:** SMB-Verbindungsfehler führen zu Reconnect mit exponentiellem Backoff (1 s … `BACKOFF_MAX_SECS`) und
-  danach zu einem vollständigen Abgleich. Fehlgeschlagene Kafka-Sends bleiben in der Pending-Liste und werden beim
+  danach zu einem vollständigen Abgleich, der ein unterbrochenes Listing fortsetzt. Fehlgeschlagene Kafka-Sends bleiben in der Pending-Liste und werden beim
   nächsten Stabilitäts-Tick erneut versucht. Ist Kafka beim Start nicht erreichbar, wird mit Backoff wiederholt.
 - **Health:** `/healthz` (Prozess läuft), `/readyz` (200 erst nach Laden des States).
 - **Metriken** (`/metrics`, Prometheus, Präfix `smb_watcher_`): `files_detected_total`, `events_sent_total`,
   `kafka_errors_total`, `reconcile_duration_seconds`, `pending_files`, `state_files`, `watcher_overflows_total`,
-  `watcher_active`, `smb_reconnects_total`.
+  `watcher_active`, `smb_reconnects_total`, `scan_resumes_total`.
 - **Speicher:** State liegt komplett im RAM (grob 150–250 Byte pro bekannter Datei plus Pfadlänge).
 
 ## Bauen und starten
@@ -146,7 +153,7 @@ Probes) liegt in [deploy/k8s.yaml](deploy/k8s.yaml).
 ## Tests
 
 ```bash
-cargo test                      # Unit-Tests: Pfade, Ignore-Patterns, Stabilität, Diff, Config, JSON-Format
+cargo test                      # Unit-Tests: Pfade, Ignore-Patterns, Stabilität, Diff, Config, JSON-Format, Fortsetzen des Scans
 tests/integration/run.sh        # Docker Compose: Samba + Kafka (KRaft), Dienst läuft auf dem Host
 KEEP_ENV=1 tests/integration/run.sh   # Container danach stehen lassen
 ```
@@ -154,7 +161,8 @@ KEEP_ENV=1 tests/integration/run.sh   # Container danach stehen lassen
 Szenarien des Integrationstests: Baseline (keine Events für vorhandene Dateien), neue Datei (via Watcher), große Datei
 im Schreibvorgang (genau ein Event mit Endgröße), Ignore-Patterns, Neustart des Dienstes (Datei während Downtime → via
 Abgleich, keine Duplikate), Neustart von Samba (Reconnect), 3000 Dateien auf einmal, Polling-Fallback
-(`USE_WATCHER=false`). Die Ports binden nur an `127.0.0.1` (Samba 14450, Kafka 19092, HTTP 18080).
+(`USE_WATCHER=false`), Samba-Neustart mitten im Abgleich (Listing wird fortgesetzt, alle Dateien gemeldet, keine
+Duplikate). Die Ports binden nur an `127.0.0.1` (Samba 14450, Kafka 19092, HTTP 18080).
 
 Hinweis zum Overflow-Pfad: Samba lieferte im Test auch bei 3000 Dateien alle Notifications ohne
 `STATUS_NOTIFY_ENUM_DIR`; der Overflow-Zweig (Abgleich 2 s nach dem Overflow) ist daher nur durch Code-Review, nicht
