@@ -1,0 +1,88 @@
+# Example manifest for k3s/Kubernetes. Adjust namespace, image and values.
+# Exactly ONE replica: two instances would both report every new file.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: smb-kafka-watcher
+type: Opaque
+stringData:
+  SMB_USER: svc-smbwatcher
+  SMB_PASSWORD: change-me
+  SMB_DOMAIN: EXAMPLE
+  # Kafka SASL (optional), passed through to librdkafka:
+  # KAFKA_PROP_SASL_USERNAME: smb-watcher
+  # KAFKA_PROP_SASL_PASSWORD: change-me
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smb-kafka-watcher
+data:
+  SMB_SERVER: fileserver.example.org
+  SMB_SHARE: scans
+  SMB_BASE_PATH: eingang
+  SMB_AUTH: ntlm
+  KAFKA_BOOTSTRAP_SERVERS: kafka-bootstrap.kafka.svc:9092
+  KAFKA_TOPIC_PREFIX: smb-watcher
+  KAFKA_CREATE_TOPICS: "false"
+  RECONCILE_INTERVAL_SECS: "300"
+  STABILITY_DELAY_SECS: "10"
+  USE_WATCHER: "true"
+  INITIAL_SCAN_EMITS_EVENTS: "false"
+  LOG_FORMAT: json
+  # KAFKA_PROP_SECURITY_PROTOCOL: SASL_SSL
+  # KAFKA_PROP_SASL_MECHANISMS: SCRAM-SHA-512
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smb-kafka-watcher
+  labels:
+    app: smb-kafka-watcher
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # never two instances at once
+  selector:
+    matchLabels:
+      app: smb-kafka-watcher
+  template:
+    metadata:
+      labels:
+        app: smb-kafka-watcher
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      enableServiceLinks: false   # keeps KAFKA_PORT & co. out of the environment
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: watcher
+          image: ghcr.io/example/smb-kafka-watcher:0.1.0
+          envFrom:
+            - configMapRef:
+                name: smb-kafka-watcher
+            - secretRef:
+                name: smb-kafka-watcher
+          ports:
+            - name: http
+              containerPort: 8080
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { memory: 512Mi }   # state map: roughly 200 B per known file
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
